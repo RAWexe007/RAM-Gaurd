@@ -14,6 +14,21 @@ namespace RamGuard
         [STAThread]
         static void Main()
         {
+            if (!TrayApp.IsAdmin())
+            {
+                try
+                {
+                    ProcessStartInfo psi = new ProcessStartInfo(Application.ExecutablePath);
+                    psi.UseShellExecute = true;
+                    psi.Verb = "runas";
+                    Process.Start(psi);
+                }
+                catch
+                {
+                    MessageBox.Show("RamGuard needs administrator rights to close some processes and to start with Windows.\n\nPlease run it again and click Yes on the prompt.", "RamGuard");
+                }
+                return;
+            }
             bool created;
             using (Mutex m = new Mutex(true, "RamGuard_SingleInstance", out created))
             {
@@ -64,7 +79,7 @@ namespace RamGuard
             return Path.GetTempPath();
         }
 
-        static bool IsAdmin()
+        internal static bool IsAdmin()
         {
             try
             {
@@ -78,6 +93,7 @@ namespace RamGuard
         readonly List<string> always = new List<string>();
         readonly List<string> idle = new List<string>();
         readonly Dictionary<string, DateTime> hiddenSince = new Dictionary<string, DateTime>();
+        readonly HashSet<string> failedLogged = new HashSet<string>();
         int graceSeconds = 30;
         int checkSeconds = 10;
         bool paused = false;
@@ -138,8 +154,14 @@ always:Microsoft.Media.Player
             Log("RamGuard started. Admin=" + IsAdmin() + ". Folder=" + dataDir + ". Always rules=" + always.Count + ", idle rules=" + idle.Count);
 
             miPause = new ToolStripMenuItem("Cleaning is ON (click to pause)", null, delegate { TogglePause(); });
-            miStartup = new ToolStripMenuItem("Start with Windows", null, delegate { SetStartup(!IsStartup()); });
-            miStartup.Checked = IsStartup();
+            miStartup = new ToolStripMenuItem("Start with Windows", null, delegate
+            {
+                bool want = !IsStartup();
+                SetStartup(want);
+                if (IsStartup() != want) MessageBox.Show("Could not change startup setting. Check the log for the exit code.", "RamGuard");
+                RefreshMenu();
+            });
+            RefreshMenu();
 
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add(miPause);
@@ -152,6 +174,7 @@ always:Microsoft.Media.Player
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, delegate { tray.Visible = false; Application.Exit(); });
 
+            menu.Opening += delegate { RefreshMenu(); };
             tray.Icon = MakeIcon(Color.LimeGreen);
             tray.Text = IsAdmin() ? "RamGuard - running (admin)" : "RamGuard - running (NOT admin)";
             tray.ContextMenuStrip = menu;
@@ -254,7 +277,11 @@ always:Microsoft.Media.Player
                     p.Kill();
                     killed++;
                 }
-                catch (Exception ex) { Log("FAILED to close " + name + " (pid " + SafeId(p) + "): " + ex.Message); }
+                catch (Exception ex)
+                {
+                    string key = name + ":" + SafeId(p);
+                    if (failedLogged.Add(key)) Log("FAILED to close " + name + " (pid " + SafeId(p) + "): " + ex.Message);
+                }
             }
             if (killed > 0) Log("Closed " + name + " (" + killed + " process, " + why + ")");
         }
@@ -270,6 +297,13 @@ always:Microsoft.Media.Player
                 File.AppendAllText(logPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg + Environment.NewLine);
             }
             catch { }
+        }
+
+        void RefreshMenu()
+        {
+            bool on = IsStartup();
+            miStartup.Checked = on;
+            miStartup.Text = "Start with Windows: " + (on ? "ON" : "OFF") + " (click to switch)";
         }
 
         void TogglePause()
@@ -312,7 +346,6 @@ always:Microsoft.Media.Player
             else
                 code = RunHidden("schtasks.exe", "/Delete /TN " + AppName + " /F");
             Log("Startup " + (on ? "enable" : "disable") + " -> exit code " + code);
-            if (miStartup != null) miStartup.Checked = IsStartup();
         }
 
         void Balloon(string text)
