@@ -19,8 +19,15 @@ namespace RamGuard
             {
                 if (!created) return;
                 try { Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
-                Application.EnableVisualStyles();
-                Application.Run(new TrayApp());
+                try
+                {
+                    Application.EnableVisualStyles();
+                    Application.Run(new TrayApp());
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("RamGuard crashed:\n\n" + ex.ToString(), "RamGuard");
+                }
             }
         }
     }
@@ -32,8 +39,41 @@ namespace RamGuard
 
         readonly NotifyIcon tray = new NotifyIcon();
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
-        readonly string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "RamGuard-list.txt");
-        readonly string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "RamGuard-log.txt");
+        readonly string dataDir = PickDir();
+        string configPath { get { return Path.Combine(dataDir, "RamGuard-list.txt"); } }
+        string logPath { get { return Path.Combine(dataDir, "RamGuard-log.txt"); } }
+
+        static string PickDir()
+        {
+            string[] options = new string[] {
+                AppDomain.CurrentDomain.BaseDirectory,
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RamGuard")
+            };
+            foreach (string d in options)
+            {
+                try
+                {
+                    Directory.CreateDirectory(d);
+                    string test = Path.Combine(d, ".write-test");
+                    File.WriteAllText(test, "x");
+                    File.Delete(test);
+                    return d;
+                }
+                catch { }
+            }
+            return Path.GetTempPath();
+        }
+
+        static bool IsAdmin()
+        {
+            try
+            {
+                return new System.Security.Principal.WindowsPrincipal(
+                    System.Security.Principal.WindowsIdentity.GetCurrent())
+                    .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+            }
+            catch { return false; }
+        }
 
         readonly List<string> always = new List<string>();
         readonly List<string> idle = new List<string>();
@@ -90,10 +130,12 @@ always:Microsoft.Media.Player
             bool firstRun = !File.Exists(configPath);
             if (firstRun)
             {
-                try { File.WriteAllText(configPath, DefaultConfig); } catch { }
+                try { File.WriteAllText(configPath, DefaultConfig); }
+                catch (Exception ex) { MessageBox.Show("Could not create list file:\n" + configPath + "\n\n" + ex.Message, "RamGuard"); }
                 SetStartup(true); // on by default, can be turned off from the tray menu
             }
             LoadConfig();
+            Log("RamGuard started. Admin=" + IsAdmin() + ". Folder=" + dataDir + ". Always rules=" + always.Count + ", idle rules=" + idle.Count);
 
             miPause = new ToolStripMenuItem("Cleaning is ON (click to pause)", null, delegate { TogglePause(); });
             miStartup = new ToolStripMenuItem("Start with Windows", null, delegate { SetStartup(!IsStartup()); });
@@ -105,12 +147,13 @@ always:Microsoft.Media.Player
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Edit list (Notepad)", null, delegate { Process.Start("notepad.exe", "\"" + configPath + "\""); });
             menu.Items.Add("Reload list", null, delegate { LoadConfig(); Balloon("List reloaded"); });
+            menu.Items.Add("Open folder", null, delegate { Process.Start("explorer.exe", "\"" + dataDir + "\""); });
             menu.Items.Add("Show log", null, delegate { if (File.Exists(logPath)) Process.Start("notepad.exe", "\"" + logPath + "\""); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, delegate { tray.Visible = false; Application.Exit(); });
 
             tray.Icon = MakeIcon(Color.LimeGreen);
-            tray.Text = "RamGuard - running";
+            tray.Text = IsAdmin() ? "RamGuard - running (admin)" : "RamGuard - running (NOT admin)";
             tray.ContextMenuStrip = menu;
             tray.Visible = true;
 
@@ -211,10 +254,12 @@ always:Microsoft.Media.Player
                     p.Kill();
                     killed++;
                 }
-                catch { }
+                catch (Exception ex) { Log("FAILED to close " + name + " (pid " + SafeId(p) + "): " + ex.Message); }
             }
             if (killed > 0) Log("Closed " + name + " (" + killed + " process, " + why + ")");
         }
+
+        static int SafeId(Process p) { try { return p.Id; } catch { return -1; } }
 
         void Log(string msg)
         {
@@ -238,28 +283,35 @@ always:Microsoft.Media.Player
             hiddenSince.Clear();
         }
 
-        bool IsStartup()
+        static int RunHidden(string file, string args)
         {
             try
             {
-                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey, false))
-                    return k != null && k.GetValue(AppName) != null;
+                ProcessStartInfo psi = new ProcessStartInfo(file, args);
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                using (Process p = Process.Start(psi)) { p.WaitForExit(15000); return p.ExitCode; }
             }
-            catch { return false; }
+            catch { return -1; }
+        }
+
+        bool IsStartup()
+        {
+            return RunHidden("schtasks.exe", "/Query /TN " + AppName) == 0;
         }
 
         void SetStartup(bool on)
         {
-            try
-            {
-                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey, true))
-                {
-                    if (k == null) return;
-                    if (on) k.SetValue(AppName, "\"" + Application.ExecutablePath + "\"");
-                    else k.DeleteValue(AppName, false);
-                }
-            }
-            catch { }
+            // remove old-style startup entry from v1 so it never starts twice
+            try { using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey, true)) { if (k != null) k.DeleteValue(AppName, false); } } catch { }
+
+            int code;
+            if (on)
+                code = RunHidden("schtasks.exe", "/Create /TN " + AppName + " /TR \"\\\"" + Application.ExecutablePath + "\\\"\" /SC ONLOGON /RL HIGHEST /F");
+            else
+                code = RunHidden("schtasks.exe", "/Delete /TN " + AppName + " /F");
+            Log("Startup " + (on ? "enable" : "disable") + " -> exit code " + code);
             if (miStartup != null) miStartup.Checked = IsStartup();
         }
 
